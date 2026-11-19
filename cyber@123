@@ -1,0 +1,158 @@
+import hashlib
+import os
+import secrets
+import sqlite3
+import string
+
+COMMON_PASSWORDS = {
+    "password", "password123", "123456", "12345678",
+    "qwerty", "abc123", "admin", "letmein", "welcome"
+}
+
+
+def init_db(db_name="password_history.db"):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS password_hashes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            pw_hash TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password: str, salt: bytes = None) -> tuple[str, str]:
+    if salt is None:
+        salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return salt.hex(), digest.hex()
+
+
+def is_reused_password(username: str, password: str, db_name="password_history.db") -> bool:
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute("SELECT salt, pw_hash FROM password_hashes WHERE username = ?", (username,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    for salt_hex, stored_hash in rows:
+        _, candidate_hash = hash_password(password, bytes.fromhex(salt_hex))
+        if candidate_hash == stored_hash:
+            return True
+    return False
+
+
+def save_password_hash(username: str, password: str, db_name="password_history.db"):
+    salt_hex, pw_hash = hash_password(password)
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO password_hashes (username, salt, pw_hash) VALUES (?, ?, ?)",
+        (username, salt_hex, pw_hash)
+    )
+    conn.commit()
+    conn.close()
+
+
+def evaluate_password(password: str, username: str = "default_user") -> dict:
+    feedback = []
+    score = 0
+
+    # 1. Length check
+    if len(password) >= 12:
+        score += 2
+    elif len(password) >= 8:
+        score += 1
+    else:
+        feedback.append("Use at least 8 characters (12+ is recommended).")
+
+    # 2. Complexity checks
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_symbol = any(c in string.punctuation for c in password)
+
+    if has_upper:
+        score += 1
+    else:
+        feedback.append("Add at least one uppercase letter (A-Z).")
+
+    if has_lower:
+        score += 1
+    else:
+        feedback.append("Add at least one lowercase letter (a-z).")
+
+    if has_digit:
+        score += 1
+    else:
+        feedback.append("Add at least one number (0-9).")
+
+    if has_symbol:
+        score += 1
+    else:
+        feedback.append("Add at least one special character (e.g., !, @, #, $).")
+
+    # 3. Uniqueness / common password check
+    if password.lower() in COMMON_PASSWORDS:
+        score = 0
+        feedback.append("This password is too common and easily guessed.")
+
+    # 4. Reuse check against database
+    reused = is_reused_password(username, password)
+    if reused:
+        feedback.append("You have already used this password before. Choose a new one.")
+
+    # Rating label
+    if reused:
+        strength = "Rejected (Previously Used)"
+    elif score >= 6:
+        strength = "Strong"
+    elif score >= 4:
+        strength = "Moderate"
+    else:
+        strength = "Weak"
+
+    return {
+        "strength": strength,
+        "score": score,
+        "feedback": feedback
+    }
+
+
+def suggest_strong_password(length: int = 14) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    while True:
+        candidate = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (
+            any(c.islower() for c in candidate)
+            and any(c.isupper() for c in candidate)
+            and any(c.isdigit() for c in candidate)
+            and any(c in "!@#$%^&*" for c in candidate)
+        ):
+            return candidate
+
+
+if __name__ == "__main__":
+    init_db()
+    user = input("Enter username: ").strip() or "student"
+    pwd = input("Enter a password to analyze: ")
+
+    result = evaluate_password(pwd, user)
+    print(f"\nStrength: {result['strength']} (Score: {result['score']}/7)")
+
+    if result["feedback"]:
+        print("Suggestions to improve:")
+        for tip in result["feedback"]:
+            print(f"  - {tip}")
+
+    if result["strength"] in ("Weak", "Moderate", "Rejected (Previously Used)"):
+        print(f"Try this strong alternative: {suggest_strong_password()}")
+    else:
+        save_choice = input("Save this password hash to history to block future reuse? (y/n): ").lower()
+        if save_choice == "y":
+            save_password_hash(user, pwd)
+            print("Password securely hashed and saved to database.")
